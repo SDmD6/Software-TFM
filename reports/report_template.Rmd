@@ -1,0 +1,669 @@
+---
+title: "Informe automático de comparación basada en redes"
+author: "TFM – Sofía Doménech"
+date: "`r format(Sys.time(), '%Y-%m-%d')`"
+output: html_document
+params:
+  project_dir: "."
+  disease1: "CMD"
+  disease2: "CM"
+  base_out: "output"
+  base_data: "data"
+  comparison_dir: "output/comparison"
+  use_absolute_paths: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+
+suppressPackageStartupMessages({
+  library(readr); library(dplyr); library(stringr); library(tidyr)
+  library(ggplot2); library(knitr); library(purrr); library(tibble)
+  library(glue)
+})
+
+`%||%` <- function(a,b) if (is.null(a)) b else a
+
+# ---- Parámetros (coherentes con YAML) ----
+proj_dir <- normalizePath(params$project_dir %||% ".", winslash = "/")
+d1 <- params$disease1
+d2 <- params$disease2
+base_out <- params$base_out
+base_data <- params$base_data
+cmp_dir  <- params$comparison_dir
+use_abs  <- isTRUE(params$use_absolute_paths)
+
+
+p_data <- function(...) file.path(proj_dir, params$base_data, ...)
+p_out  <- function(...) file.path(proj_dir, params$base_out,  ...)
+p_cmp  <- function(...) file.path(proj_dir, params$comparison_dir, ...)
+
+safe_read <- function(path){
+  if (!is.na(path) && file.exists(path)) readr::read_tsv(path, show_col_types = FALSE) else NULL
+}
+
+find_first <- function(paths){
+  for (p in paths) if (!is.na(p) && file.exists(p)) return(p)
+  NA_character_
+}
+
+# Rutas candidatas por tipo (aceptan tus variantes)
+paths_hpo <- function(d) p_data("training_genes", paste0(d, "_training_genes.tsv"))
+
+paths_net_summary <- function(d) c(
+  p_out(d, "network", paste0(d, "_network_summary.tsv")),
+  p_out("network",     paste0(d, "_network_summary.tsv"))
+)
+
+paths_go <- function(d) c(
+  p_out(d, "enrichment", paste0(d, "_GO_enrichment.tsv")),
+  p_out("enrichment",     paste0(d, "_GO_enrichment.tsv"))
+)
+
+paths_kegg <- function(d) c(
+  p_out(d, "enrichment", paste0(d, "_KEGG_enrichment.tsv")),
+  p_out("enrichment",     paste0(d, "_KEGG_enrichment.tsv"))
+)
+
+paths_prio_topo <- function(d) p_cmp(paste0("prioritized_genes_", d, ".tsv"))
+
+paths_yatra <- function(d) c(
+  p_out(d, "prioritization", "yatra_ranking.tsv"),
+  p_out(d, "prioritization", "combined_ranking.tsv")  # compatibilidad con tu salida actual
+)
+
+path_common_genes <- p_cmp("common_genes.tsv")
+path_shared_go    <- p_cmp("shared_go_terms.tsv")
+path_shared_kegg  <- p_cmp("shared_kegg_paths.tsv")
+```
+
+```{r versiones}
+suppressPackageStartupMessages({
+  library(dplyr); library(tibble); library(knitr); library(purrr)
+})
+
+# Paquetes que usa el proyecto
+req_pkgs <- c(
+  "tidyverse","readr","dplyr","tidyr","stringr","ggplot2","purrr","tibble","glue",
+  "fs","scales",
+  "igraph","tidygraph","ggraph","ggrepel",
+  "pheatmap","ggvenn","circlize",
+  "clusterProfiler","org.Hs.eg.db",
+  "BiocManager","sessioninfo"
+)
+
+# Info por paquete
+pkg_info <- function(pkg){
+  installed <- requireNamespace(pkg, quietly = TRUE)
+  ver <- if (installed) as.character(utils::packageVersion(pkg)) else NA_character_
+  src <- if (installed) {
+    d <- utils::packageDescription(pkg)
+    if (!is.null(d$Repository) && grepl("bioconductor", tolower(d$Repository))) "Bioconductor"
+    else if (!is.null(d$Repository)) "CRAN"
+    else if (!is.null(d$biocViews)) "Bioconductor"
+    else "Local/Git"
+  } else NA_character_
+  tibble(Paquete = pkg, Versión = ver, Origen = src, Instalado = installed)
+}
+
+ver_tbl <- purrr::map_dfr(req_pkgs, pkg_info) |>
+  mutate(Cargable = Instalado)
+
+# Cabecera compacta
+R_version <- paste(R.version$major, R.version$minor, sep=".")
+Bioc_ver  <- tryCatch(as.character(BiocManager::version()), error = function(e) "—")
+cat(sprintf("**R:** %s  \n**Plataforma:** %s  \n**Bioconductor:** %s  \n**Cairo disponible:** %s\n\n",
+            R_version, R.version$platform, Bioc_ver, capabilities("cairo")))
+
+# Tabla
+knitr::kable(ver_tbl, caption = "Versiones de paquetes requeridos")
+
+# Resumen detallado (opcional, útil para reproducibilidad)
+if (requireNamespace("sessioninfo", quietly = TRUE)) {
+  sessioninfo::session_info(pkgs = ver_tbl$Paquete[ver_tbl$Instalado])
+} else {
+  sessionInfo()
+}
+
+```
+
+## Checklist
+```{r checklist_entradas, echo=FALSE}
+mk_item <- function(desc, candidates){
+  p <- if (length(candidates) > 1) find_first(candidates) else candidates
+  tibble(
+    Descripción = desc,
+    Ruta        = p,
+    Existe      = !is.na(p) & file.exists(p)
+  )
+}
+
+chk_tbl <- dplyr::bind_rows(
+  mk_item(glue("Genes HPO ({d1})"),           paths_hpo(d1)),
+  mk_item(glue("Genes HPO ({d2})"),           paths_hpo(d2)),
+  mk_item(glue("Resumen red ({d1})"),         paths_net_summary(d1)),
+  mk_item(glue("Resumen red ({d2})"),         paths_net_summary(d2)),
+  mk_item(glue("Enriquecimiento GO-BP ({d1})"), paths_go(d1)),
+  mk_item(glue("Enriquecimiento GO-BP ({d2})"), paths_go(d2)),
+  mk_item(glue("Enriquecimiento KEGG ({d1})"),  paths_kegg(d1)),
+  mk_item(glue("Enriquecimiento KEGG ({d2})"),  paths_kegg(d2)),
+  mk_item(glue("Ranking topológico ({d1})"),  paths_prio_topo(d1)),
+  mk_item(glue("Ranking topológico ({d2})"),  paths_prio_topo(d2)),
+  mk_item(glue("Ranking Yatra ({d1})"),       paths_yatra(d1)),
+  mk_item(glue("Ranking Yatra ({d2})"),       paths_yatra(d2)),
+  mk_item("Comparación: genes compartidos",   path_common_genes),
+  mk_item("Comparación: GO compartidos",      path_shared_go),
+  mk_item("Comparación: KEGG compartidos",    path_shared_kegg),
+  mk_item("Comparación: Jaccard top-k rankings", p_cmp("jaccard_topk_rankings.tsv"))  
+)
+
+
+
+knitr::kable(chk_tbl, caption = "Checklist de entradas requeridas (rutas absolutas)")
+```
+
+
+## Lectura de datos
+```{r resumen_genes_hpo, echo=FALSE}
+hpo1 <- safe_read(paths_hpo(d1))
+hpo2 <- safe_read(paths_hpo(d2))
+n1 <- if (is.null(hpo1)) 0 else nrow(hpo1)
+n2 <- if (is.null(hpo2)) 0 else nrow(hpo2)
+tibble(Enfermedad = c(d1, d2), Genes_totales = c(n1, n2)) |> knitr::kable()
+```
+
+
+## Enriquecimiento GO y KEGG (top-15, exclusivas, compartidas, Jaccard)
+```{r go_kegg_enrichment, echo=FALSE}
+enr1  <- safe_read(find_first(paths_go(d1)))
+enr2  <- safe_read(find_first(paths_go(d2)))
+kegg1 <- safe_read(find_first(paths_kegg(d1)))
+kegg2 <- safe_read(find_first(paths_kegg(d2)))
+
+fmt_enr <- function(x, disease, titulo){
+  if (is.null(x) || nrow(x) == 0) return(knitr::kable(tibble(Mensaje = glue("Sin resultados {titulo} para {disease}"))))
+  x |>
+    arrange(p.adjust) |>
+    mutate(p.adjust = signif(p.adjust, 3)) |>
+    select(Description, GeneRatio, BgRatio, p.adjust, Count) |>
+    head(15) |>
+    knitr::kable(caption = glue("Top-15 {titulo} (p-ajustada) – {disease}"))
+}
+
+fmt_enr(enr1, d1, "GO-BP")
+fmt_enr(enr2, d2, "GO-BP")
+fmt_enr(kegg1, d1, "KEGG")
+fmt_enr(kegg2, d2, "KEGG")
+
+# Exclusivos/compartidos y Jaccard (GO)
+if (!is.null(enr1) && !is.null(enr2) && nrow(enr1) > 0 && nrow(enr2) > 0) {
+  s1 <- unique(enr1$Description)
+  s2 <- unique(enr2$Description)
+  shared_go <- sort(intersect(s1, s2))
+  excl1_go  <- sort(setdiff(s1, s2))
+  excl2_go  <- sort(setdiff(s2, s1))
+  if (length(shared_go) > 0)
+    knitr::kable(tibble(`Términos GO compartidos` = shared_go), caption = "GO-BP compartidos")
+  if (length(excl1_go) > 0)
+    knitr::kable(tibble(`Exclusivos de` = d1, Término = head(excl1_go, 20)), caption = glue("Top-20 GO exclusivos de {d1}"))
+  if (length(excl2_go) > 0)
+    knitr::kable(tibble(`Exclusivos de` = d2, Término = head(excl2_go, 20)), caption = glue("Top-20 GO exclusivos de {d2}"))
+  j_go <- length(shared_go) / length(union(s1, s2))
+  knitr::kable(tibble(`Jaccard GO` = signif(j_go, 3)), caption = "Solapamiento GO")
+}
+
+# Exclusivos/compartidos y Jaccard (KEGG, padj ≤ 0.05)
+if (!is.null(kegg1) && !is.null(kegg2) && nrow(kegg1) > 0 && nrow(kegg2) > 0) {
+  s1 <- kegg1 |> filter(p.adjust <= 0.05) |> pull(Description) |> unique()
+  s2 <- kegg2 |> filter(p.adjust <= 0.05) |> pull(Description) |> unique()
+  shared_kegg <- sort(intersect(s1, s2))
+  excl1_kegg  <- sort(setdiff(s1, s2))
+  excl2_kegg  <- sort(setdiff(s2, s1))
+  if (length(shared_kegg) > 0) {
+    knitr::kable(tibble(`Rutas KEGG compartidas (padj ≤ 0.05)` = shared_kegg),
+                 caption = "Rutas KEGG compartidas")
+    # Guardamos para el checklist
+    readr::write_tsv(tibble(pathway = shared_kegg),
+                     path_shared_kegg)
+  }
+  if (length(excl1_kegg) > 0)
+    knitr::kable(tibble(`Exclusivas de` = d1, Ruta = head(excl1_kegg, 20)),
+                 caption = glue("Top-20 KEGG exclusivas de {d1}"))
+  if (length(excl2_kegg) > 0)
+    knitr::kable(tibble(`Exclusivas de` = d2, Ruta = head(excl2_kegg, 20)),
+                 caption = glue("Top-20 KEGG exclusivas de {d2}"))
+  j_kegg <- if (length(union(s1, s2)) == 0) NA_real_ else length(shared_kegg) / length(union(s1, s2))
+  knitr::kable(tibble(`Jaccard KEGG (padj ≤ 0.05)` = signif(j_kegg, 3)), caption = "Solapamiento KEGG")
+}
+```
+
+## Solapamiento de rankings (top-k)
+```{r jaccard_rankings, echo=FALSE}
+jr <- safe_read(p_cmp("jaccard_topk_rankings.tsv"))
+if (!is.null(jr)) {
+  jr %>% mutate(jaccard = signif(jaccard, 3)) %>%
+    knitr::kable(caption = "Índice de Jaccard en top-k de rankings (topológico y Yatra)")
+} else {
+  knitr::kable(tibble(Mensaje = "Sin archivo jaccard_topk_rankings.tsv"))
+}
+```
+
+## Rankings (topológico + Yatra, con compatibilidad)
+```{r rankings, echo=FALSE}
+tp1 <- safe_read(paths_prio_topo(d1))
+tp2 <- safe_read(paths_prio_topo(d2))
+yr1 <- safe_read(find_first(paths_yatra(d1)))
+yr2 <- safe_read(find_first(paths_yatra(d2)))
+
+tab_prio <- function(tb, disease, method){
+  if (is.null(tb) || nrow(tb) == 0) return(knitr::kable(tibble(Mensaje = glue("Sin ranking disponible ({method}) para {disease}"))))
+  # intenta identificar la columna de score (última si no está nombrada)
+  lastcol <- names(tb)[ncol(tb)]
+  out <- tb |>
+    dplyr::mutate(rank = dplyr::row_number()) |>
+    dplyr::relocate(rank, .before = dplyr::everything())
+  if (!"score" %in% names(out) && lastcol != "gene") names(out)[names(out) == lastcol] <- "score"
+  knitr::kable(out |> dplyr::select(dplyr::any_of(c("rank","gene","score"))) |> head(20),
+               caption = glue("Top-20 priorización ({method}) – {disease}"))
+}
+
+tab_prio(tp1, d1, "topológica")
+tab_prio(tp2, d2, "topológica")
+
+if (!is.null(yr1)) knitr::kable(head(yr1, 20), caption = glue("Top-20 Yatra – {d1}")) else knitr::kable(tibble(Mensaje = glue("Sin ranking Yatra para {d1}")))
+if (!is.null(yr2)) knitr::kable(head(yr2, 20), caption = glue("Top-20 Yatra – {d2}")) else knitr::kable(tibble(Mensaje = glue("Sin ranking Yatra para {d2}")))
+```
+
+##Tabla resumen
+```{r tabla, echo=FALSE}
+glob <- safe_read(p_cmp("global_overlap_summary.tsv"))
+
+# Si no existe, generamos una tabla vacía pero con columnas esperadas (no rompe el render)
+if (is.null(glob)) {
+  glob <- tibble::tibble(
+    disease1          = params$disease1,
+    disease2          = params$disease2,
+    n_training_d1     = NA_integer_,
+    n_training_d2     = NA_integer_,
+    n_common_genes    = NA_integer_,
+    n_shared_go_terms = NA_integer_,
+    jaccard_training  = NA_real_,
+    jaccard_topo50    = NA_real_,
+    jaccard_yatra50   = NA_real_
+  )
+}
+
+glob_fmt <- glob %>%
+  mutate(across(everything(), ~ifelse(is.na(.), "—", .)))
+
+knitr::kable(glob_fmt,
+             caption = "Tabla 4.6.1. Resumen global de similitudes y diferencias entre CMD y CM")
+
+```
+
+###Redes anotadas por enfermedad
+```{r redes_anotadas, fig.cap="Redes anotadas de CMD y CM"}
+# Usa d1 y d2 definidos en el setup, y la utilidad find_first que ya tienes.
+img1 <- find_first(c(
+  file.path(params$project_dir, params$base_out, d1, "plots", paste0(d1, "_network_annotated.png")),
+  file.path(params$project_dir, params$base_out, "plots",        paste0(d1, "_network_annotated.png"))
+))
+img2 <- find_first(c(
+  file.path(params$project_dir, params$base_out, d2, "plots", paste0(d2, "_network_annotated.png")),
+  file.path(params$project_dir, params$base_out, "plots",        paste0(d2, "_network_annotated.png"))
+))
+
+if (is.na(img1) || is.na(img2) || !file.exists(img1) || !file.exists(img2)) {
+  stop("No encuentro alguna de las imágenes de redes anotadas:\n",
+       " - ", img1, "\n",
+       " - ", img2, "\n",
+       "Revisa dónde se guardaron o ajusta las rutas.")
+}
+
+knitr::include_graphics(c(img1, img2))
+```
+
+###Comparación de métricas globales
+```{r comparación_metricas, echo=FALSE}
+# Rutas esperadas
+p_global <- file.path(params$project_dir, params$base_out, "plots", "global_metrics_comparison.png")
+p_net    <- file.path(params$project_dir, params$base_out, "plots", "network_metrics_comparison.png")
+p_nodes  <- file.path(params$project_dir, params$base_out, "plots", "total_nodes_comparison.png")
+
+# Si faltan, las generamos rápidamente
+if (!file.exists(p_net) || !file.exists(p_nodes)) {
+  dir.create(dirname(p_net), recursive = TRUE, showWarnings = FALSE)
+
+  # 1) Cargamos el resumen (si existe)
+  summary_df <- safe_read(p_cmp("network_summary.tsv"))
+
+  # 2) network_metrics_comparison.png (métricas globales)
+  if (!file.exists(p_net)) {
+    if (!is.null(summary_df) && nrow(summary_df) > 0) {
+      summary_long <- summary_df %>%
+        dplyr::select(disease, dplyr::any_of(c("degree_mean","betweenness_mean","clustering_mean"))) %>%
+        tidyr::pivot_longer(-disease, names_to = "métrica", values_to = "valor") %>%
+        dplyr::mutate(métrica = dplyr::recode(métrica,
+                    degree_mean = "Grado promedio",
+                    betweenness_mean = "Intermediación",
+                    clustering_mean = "Agrupamiento"))
+      g_net <- ggplot2::ggplot(summary_long, aes(x = disease, y = valor, fill = disease)) +
+        ggplot2::geom_col(position = "dodge") +
+        ggplot2::facet_wrap(~métrica, scales = "free_y") +
+        ggplot2::theme_minimal() +
+        ggplot2::labs(title = "Métricas globales de red", x = NULL, y = NULL)
+      ggplot2::ggsave(p_net, g_net, width = 9, height = 5, dpi = 300, bg = "white")
+    }
+  }
+
+  # 3) total_nodes_comparison.png (nº de nodos por enfermedad)
+  if (!file.exists(p_nodes)) {
+    # Localizador sencillo de la mejor red (physical -> functional)
+    find_edges_file <- function(d) {
+      cands <- c(
+        file.path(params$project_dir, params$base_out, "network", paste0(d, "_network_physical.tsv")),
+        file.path(params$project_dir, params$base_out, "network", paste0(d, "_network_functional.tsv")),
+        file.path(params$project_dir, params$base_out, d, "network", paste0(d, "_network_physical.tsv")),
+        file.path(params$project_dir, params$base_out, d, "network", paste0(d, "_network_functional.tsv"))
+      )
+      cand <- cands[file.exists(cands)][1]
+      ifelse(length(cand) == 0, NA_character_, cand)
+    }
+
+    df_counts <- purrr::map_dfr(c(params$disease1, params$disease2), function(d){
+      f <- find_edges_file(d)
+      if (is.na(f)) return(tibble::tibble(disease = d, n_nodes = NA_integer_))
+      ed <- readr::read_tsv(f, show_col_types = FALSE)
+      # Normaliza columnas si no se llaman exactamente from_gene/to_gene
+      if (!all(c("from_gene","to_gene") %in% names(ed))) {
+        col_from <- intersect(c("from_gene","from","source","u","Source"), names(ed))[1]
+        col_to   <- intersect(c("to_gene","to","target","v","Target"), names(ed))[1]
+        ed <- ed %>% dplyr::rename(from_gene = !!col_from, to_gene = !!col_to)
+      }
+      genes <- unique(c(ed$from_gene, ed$to_gene))
+      tibble::tibble(disease = d, n_nodes = length(genes))
+    })
+
+    g_nodes <- ggplot2::ggplot(df_counts, aes(x = disease, y = n_nodes, fill = disease)) +
+      ggplot2::geom_col() +
+      ggplot2::theme_minimal() +
+      ggplot2::labs(title = "Nº total de nodos por enfermedad", x = NULL, y = "Nodos")
+    ggplot2::ggsave(p_nodes, g_nodes, width = 7, height = 4, dpi = 300, bg = "white")
+  }
+}
+
+# Inserta solo lo que exista (para no romper el render)
+imgs <- c(p_global, p_net, p_nodes)
+imgs <- imgs[file.exists(imgs)]
+if (length(imgs) == 0) {
+  knitr::kable(tibble::tibble(Mensaje = "No se encontraron figuras de comparación de métricas."))
+} else {
+  knitr::include_graphics(imgs)
+}
+```
+
+###Distribuciones nodales y relaciones estructurales
+```{r distribuciones_nodales, echo=FALSE}
+p_deg    <- file.path(params$project_dir, params$base_out, "plots", "degree_distribution.png")
+p_degbet <- file.path(params$project_dir, params$base_out, "plots", "degree_vs_betweenness.png")
+
+if (!file.exists(p_deg) || !file.exists(p_degbet)) {
+  suppressPackageStartupMessages({ library(tidyverse); library(readr); library(igraph) })
+  dir.create(dirname(p_deg), recursive = TRUE, showWarnings = FALSE)
+
+  # --- Localizadores robustos ---
+  find_nodes_file <- function(d){
+    cands <- c(
+      file.path(params$project_dir, params$base_out, "network", paste0(d, "_node_metrics.tsv")),
+      file.path(params$project_dir, params$base_out, d, "network", paste0(d, "_node_metrics.tsv"))
+    )
+    cand <- cands[file.exists(cands)][1]
+    ifelse(length(cand) == 0, NA_character_, cand)
+  }
+  find_edges_best <- function(d){
+    cands <- c(
+      file.path(params$project_dir, params$base_out, "network", paste0(d, "_network_physical.tsv")),
+      file.path(params$project_dir, params$base_out, d, "network", paste0(d, "_network_physical.tsv")),
+      file.path(params$project_dir, params$base_out, "network", paste0(d, "_network_functional.tsv")),
+      file.path(params$project_dir, params$base_out, d, "network", paste0(d, "_network_functional.tsv"))
+    )
+    cand <- cands[file.exists(cands)][1]
+    ifelse(length(cand) == 0, NA_character_, cand)
+  }
+
+  # Carga métricas nodales (o las calcula a partir de la red)
+  load_nodes_metrics <- function(d){
+    nf <- find_nodes_file(d)
+    if (!is.na(nf)) {
+      nd <- readr::read_tsv(nf, show_col_types = FALSE)
+      cols <- names(nd)
+      gene_col <- intersect(c("gene","name","symbol","node"), cols)[1]
+      deg_col  <- intersect(c("degree","k","degree_all"), cols)[1]
+      bet_col  <- intersect(c("betweenness","betweenness_centrality","bet"), cols)[1]
+      if (!is.na(gene_col) && !is.na(deg_col) && !is.na(bet_col)) {
+        return(nd %>% transmute(
+          gene        = .data[[gene_col]],
+          degree      = as.numeric(.data[[deg_col]]),
+          betweenness = as.numeric(.data[[bet_col]])
+        ))
+      }
+    }
+    # Fallback: construir grafo y calcular degree/betweenness
+    ef <- find_edges_best(d)
+    if (is.na(ef)) return(tibble(gene = character(), degree = numeric(), betweenness = numeric()))
+    ed <- readr::read_tsv(ef, show_col_types = FALSE)
+    col_from <- intersect(c("from_gene","from","source","u","Source"), names(ed))[1]
+    col_to   <- intersect(c("to_gene","to","target","v","Target"),  names(ed))[1]
+    stopifnot(!is.na(col_from), !is.na(col_to))
+    g <- graph_from_data_frame(ed[, c(col_from, col_to)], directed = FALSE) |> simplify()
+    tibble(
+      gene        = names(V(g)),
+      degree      = degree(g, mode = "all"),
+      betweenness = betweenness(g, directed = FALSE, normalized = TRUE)
+    )
+  }
+
+  d1 <- params$disease1; d2 <- params$disease2
+  n1 <- load_nodes_metrics(d1) %>% mutate(Enfermedad = d1)
+  n2 <- load_nodes_metrics(d2) %>% mutate(Enfermedad = d2)
+  nodes_all <- bind_rows(n1, n2) %>% filter(is.finite(degree), is.finite(betweenness))
+
+  # ---- degree_distribution.png (si falta) ----
+  if (!file.exists(p_deg) && nrow(nodes_all) > 0) {
+    g1 <- ggplot(nodes_all, aes(x = degree, fill = Enfermedad)) +
+      geom_density(alpha = 0.5, adjust = 1) +
+      scale_x_continuous(trans = "log1p") +
+      theme_minimal() +
+      labs(title = "Distribución del grado de conectividad", x = "degree (log1p)", y = "densidad")
+    ggsave(p_deg, g1, width = 9, height = 5, dpi = 300, bg = "white")
+  }
+
+  # ---- degree_vs_betweenness.png (si falta) ----
+  if (!file.exists(p_degbet) && nrow(nodes_all) > 0) {
+    g2 <- ggplot(nodes_all, aes(x = degree, y = betweenness, color = Enfermedad)) +
+      geom_point(alpha = 0.5, size = 1.5) +
+      scale_x_continuous(trans = "log1p") +
+      scale_y_continuous(trans = "log1p") +
+      theme_minimal() +
+      labs(title = "Relación degree vs betweenness", x = "degree (log1p)", y = "betweenness (log1p)")
+    ggsave(p_degbet, g2, width = 9, height = 5, dpi = 300, bg = "white")
+  }
+}
+
+# Insertar solo lo que exista
+imgs <- c(p_deg, p_degbet)
+imgs <- imgs[file.exists(imgs)]
+if (length(imgs) == 0) {
+  knitr::kable(tibble::tibble(Mensaje = "No se pudieron generar las figuras de distribuciones nodales."))
+} else {
+  knitr::include_graphics(imgs)
+}
+```
+
+###Comparaciones funcionales
+```{r comparaciones_funcionales_go_kegg, echo=FALSE}
+suppressPackageStartupMessages({library(tidyverse); library(readr); library(glue); library(stringr)})
+
+# Rutas base
+pdir <- params$project_dir; bout <- params$base_out
+plots_dir <- file.path(pdir, bout, "plots")
+dir.create(plots_dir, recursive = TRUE, showWarnings = FALSE)
+
+# Archivos esperados
+p_venn_go   <- file.path(plots_dir, "venn_go_terms.png")
+p_excl_go   <- file.path(plots_dir, "exclusive_go_terms_barplot.png")
+p_venn_kegg <- file.path(plots_dir, "venn_kegg_terms.png")            # <-- corregido el typo
+p_heat_kegg <- file.path(plots_dir, "heatmap_kegg_terms.png")
+p_chord     <- file.path(plots_dir, "chordplot_kegg_shared.png")
+p_kegg_bar  <- file.path(plots_dir, "kegg_barplot.png")
+
+# Helpers para localizar enriquecimientos (coinciden con tus rutas)
+p_out  <- function(...) file.path(pdir, bout, ...)
+paths_go <- function(d) c(
+  p_out(d, "enrichment", paste0(d, "_GO_enrichment.tsv")),
+  p_out("enrichment",     paste0(d, "_GO_enrichment.tsv"))
+)
+paths_kegg <- function(d) c(
+  p_out(d, "enrichment", paste0(d, "_KEGG_enrichment.tsv")),
+  p_out("enrichment",     paste0(d, "_KEGG_enrichment.tsv"))
+)
+find_first <- function(paths){ for (p in paths) if (file.exists(p)) return(p); NA_character_ }
+safe_read  <- function(path){ if (!is.na(path) && file.exists(path)) readr::read_tsv(path, show_col_types = FALSE) else NULL }
+
+d1 <- params$disease1; d2 <- params$disease2
+go1   <- safe_read(find_first(paths_go(d1)))
+go2   <- safe_read(find_first(paths_go(d2)))
+kegg1 <- safe_read(find_first(paths_kegg(d1)))
+kegg2 <- safe_read(find_first(paths_kegg(d2)))
+
+# ---- (1) Barplot de EXCLUSIVOS GO (si falta, lo creamos) ----
+if (!file.exists(p_excl_go) && !is.null(go1) && !is.null(go2) && nrow(go1)>0 && nrow(go2)>0) {
+  s1 <- unique(go1$Description); s2 <- unique(go2$Description)
+  excl1 <- setdiff(s1, s2); excl2 <- setdiff(s2, s1)
+  df <- tibble(Enfermedad = c(d1, d2),
+               Exclusivos = c(length(excl1), length(excl2)))
+  g <- ggplot(df, aes(x = Enfermedad, y = Exclusivos, fill = Enfermedad)) +
+    geom_col(width = 0.6) +
+    geom_text(aes(label = Exclusivos), vjust = -0.4, size = 4) +
+    theme_minimal() +
+    labs(title = "Términos GO exclusivos por enfermedad", x = NULL, y = "Nº de términos")
+  ggsave(p_excl_go, g, width = 7, height = 4.5, dpi = 300, bg = "white")
+}
+
+# ---- (2) Heatmap KEGG presencia/ausencia (si falta, lo creamos) ----
+if (!file.exists(p_heat_kegg) && !is.null(kegg1) && !is.null(kegg2) &&
+    nrow(kegg1)>0 && nrow(kegg2)>0) {
+
+  all_terms <- union(kegg1$Description, kegg2$Description)
+  df <- tibble(
+    Term = all_terms,
+    !!d1 := as.integer(all_terms %in% kegg1$Description),
+    !!d2 := as.integer(all_terms %in% kegg2$Description)
+  ) %>% pivot_longer(-Term, names_to = "Disease", values_to = "Present")
+
+  term_cat <- df %>%
+    group_by(Term) %>%
+    summarize(p1 = any(Disease == d1 & Present == 1),
+              p2 = any(Disease == d2 & Present == 1),
+              .groups = "drop") %>%
+    mutate(RowCat = case_when(
+      p1 &  p2 ~ "Compartidas",
+      p1 & !p2 ~ paste("Exclusivas", d1),
+     !p1 &  p2 ~ paste("Exclusivas", d2)
+    )) %>% select(Term, RowCat)
+
+  df2 <- df %>% left_join(term_cat, by = "Term")
+
+  # Limitar por grupo para legibilidad
+  max_terms_per_group <- 35
+  keep <- df2 %>% distinct(Term, RowCat) %>%
+    group_by(RowCat) %>% arrange(Term, .by_group = TRUE) %>%
+    slice_head(n = max_terms_per_group) %>% pull(Term)
+  df2 <- df2 %>% filter(Term %in% keep)
+
+  order_terms <- df2 %>% distinct(Term, RowCat) %>%
+    mutate(RowCat = factor(RowCat, levels = c("Compartidas",
+                                              paste("Exclusivas", d1),
+                                              paste("Exclusivas", d2)))) %>%
+    arrange(RowCat, Term) %>% pull(Term)
+
+  df2 <- df2 %>%
+    mutate(
+      Term_wrap = stringr::str_wrap(Term, width = 55),
+      Term_wrap = factor(Term_wrap, levels = stringr::str_wrap(order_terms, 55)),
+      Disease   = factor(Disease, levels = c(d1, d2)),
+      RowCat    = factor(RowCat, levels = c("Compartidas",
+                                            paste("Exclusivas", d1),
+                                            paste("Exclusivas", d2)))
+    )
+
+  g <- ggplot(df2, aes(x = Disease, y = Term_wrap, fill = factor(Present))) +
+    geom_tile(color = "grey85", linewidth = 0.3, width = 0.95, height = 0.95) +
+    scale_fill_manual(values = c("0" = "white", "1" = "#F28E2B"),
+                      labels = c("Ausente", "Presente"), name = NULL) +
+    facet_grid(RowCat ~ ., scales = "free_y", space = "free_y") +
+    labs(title = "Presencia/ausencia de rutas KEGG",
+         subtitle = glue("{d1} vs {d2}"),
+         x = NULL, y = NULL) +
+    theme_minimal(base_size = 11) +
+    theme(panel.grid = element_blank(),
+          strip.text.y = element_text(face = "bold"),
+          axis.text.x  = element_text(face = "bold"),
+          axis.text.y  = element_text(size = 8))
+
+  height_cm <- max(10, nlevels(df2$Term_wrap) * 0.22 + 6)
+  ggsave(p_heat_kegg, g, width = 28, height = height_cm, units = "cm", dpi = 300, bg = "white")
+}
+
+# Si existe una versión alternativa ya creada, úsala como fallback
+if (!file.exists(p_heat_kegg)) {
+  alt_heat <- file.path(plots_dir, "heatmap_kegg_terms_facetas.png")
+  if (file.exists(alt_heat)) p_heat_kegg <- alt_heat
+}
+
+# Insertar solo lo que exista (los demás ya estaban generados en pasos previos)
+imgs <- c(p_venn_go, p_excl_go, p_venn_kegg, p_heat_kegg, p_chord, p_kegg_bar)
+imgs <- imgs[file.exists(imgs)]
+
+if (length(imgs) == 0) {
+  knitr::kable(tibble::tibble(Mensaje = "No se pudieron generar las figuras GO/KEGG."))
+} else {
+  knitr::include_graphics(imgs)
+}
+
+```
+
+###Heatmap go terms
+```{r heatmap_go_terms, echo=FALSE}
+suppressPackageStartupMessages({library(glue)})
+
+pdir <- params$project_dir
+bout <- params$base_out
+cands <- c(
+  file.path(pdir, bout, "plots", "heatmap_go_terms_facetas_resumen.png"),
+  file.path(pdir, bout, "plots", "heatmap_go_terms_facetas.png"),
+  file.path("output","plots","heatmap_go_terms_facetas_resumen.png"),
+  "heatmap_go_terms_facetas_resumen.png"
+)
+
+img <- cands[file.exists(cands)][1]
+if (length(img) == 0 || is.na(img)) {
+  knitr::kable(tibble::tibble(Mensaje = "No se encontró heatmap_go_terms_facetas_resumen.png en rutas conocidas."))
+} else {
+  knitr::include_graphics(img)
+}
+
+
+```
+
+###Integración de priorización
+```{r integración_priorización}
+knitr::include_graphics(c(
+  file.path(params$project_dir, params$base_out, "comparison", "plots", "CMD_corr_yatra_topo.png"),
+  file.path(params$project_dir, params$base_outt, "comparison", "plots", "CM_corr_yatra_topo.png"),
+  file.path(params$project_dir, params$base_out, "CMD", "plots", "CMD_yatra_top20_subnetwork.png"),
+  file.path(params$project_dir, params$base_out, "CM", "plots", "CM_yatra_top20_subnetwork.png")
+))
+```
+
+

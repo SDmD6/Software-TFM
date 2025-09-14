@@ -1,0 +1,5 @@
+Categoria	CMD_total	CM_total	Compartidos	Exclusivos_CMD	Exclusivos_CM	Jaccard
+Genes	303	2167	265	38	1902	NA
+GO-BP	386	1780	291	95	1489	0.155
+KEGG	24	129	13	11	116	0.093
+Rankings	NA	NA	NA	NA	NA	0.075

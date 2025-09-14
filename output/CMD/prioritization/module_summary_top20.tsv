@@ -1,0 +1,5 @@
+disease	topN	expanded	module	module_size	GO_BP_top	GO_BP_padj	KEGG_top	KEGG_padj
+CMD	20	FALSE	3	5	regulation of smoothened signaling pathway | smoothened signaling pathway | spinal cord motor neuron differentiation	7.2e-07 | 3.09e-06 | 3.71e-06	Hedgehog signaling pathway | Basal cell carcinoma | Vasopressin-regulated water reabsorption	0.000458 | 0.000458 | 0.0325
+CMD	20	FALSE	4	4	positive regulation of plasma membrane bounded cell projection assembly | positive regulation of cell-substrate adhesion | regulation of plasma membrane bounded cell projection assembly	0.000287 | 0.000287 | 0.000541	VEGF signaling pathway | Renal cell carcinoma | AGE-RAGE signaling pathway in diabetic complications	8.84e-05 | 8.84e-05 | 0.000179
+CMD	20	FALSE	1	2	NA	NA	NA	NA
+CMD	20	FALSE	2	2	NA	NA	NA	NA

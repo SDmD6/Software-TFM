@@ -1,0 +1,2 @@
+disease_1	disease_2	n_kegg_1	n_kegg_2	n_shared	jaccard_index
+CMD	CM	24	129	13	0.09285714285714286
